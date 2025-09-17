@@ -3,8 +3,7 @@ from telebot import types
 from yt_dlp import YoutubeDL
 import sqlite3, os
 import threading
-
-TOKEN = '8209533216:AAHQghbOE_4yQjBuj5-F_yV1hS5qx7i89Oo'
+ghbOE_4yQjBuj5-F_yV1hS5qx7i89Oo'
 bot = telebot.TeleBot(TOKEN)
 
 # Database setup
@@ -165,4 +164,5 @@ def handle_quality(call):
     threading.Thread(target=download_video, args=(url, quality, call.message.chat.id, user_id)).start()
 
 bot.polling()
+
 
