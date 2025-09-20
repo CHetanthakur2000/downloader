@@ -6,6 +6,7 @@ import threading
 import shutil
 import sqlite3
 import subprocess
+from telethon import TelegramClient
 from telebot import TeleBot, types
 from yt_dlp import YoutubeDL
 from moviepy.editor import VideoFileClip
@@ -20,11 +21,17 @@ def trim_video_ffmpeg(input_path, output_path, start, end):
         "-c", "copy", output_path
     ]
     subprocess.run(cmd, check=True)
+    
+    
+        # return message ID to create link
 
 # ---------------- CONFIG ----------------
 TOKEN = "8209533216:AAHQghbOE_4yQjBuj5-F_yV1hS5qx7i89Oo"
-GCS_BUCKET_NAME = "your-gcs-bucket-name"
-ADMIN_ID = 7966696528  # change to your admin Telegram id
+ADMIN_ID = 7966696528
+CHANNEL = -1002969400828
+api_id =  12609898                 # tumhara api_id yahan
+api_hash = "592613fe102f88f6134f72b6f807235f"   # tumhara api_hash yahan
+# change to your admin Telegram id
 # Make sure environment variable GOOGLE_APPLICATION_CREDENTIALS is set to service account JSON path
 
 bot = TeleBot(TOKEN)
@@ -45,6 +52,13 @@ def is_premium(user_id):
 user_data_lock = threading.Lock()
 user_data = {}  # { chat_id: {...} }
 
+client = TelegramClient('session_name', api_id, api_hash)
+
+async def upload_to_channel(file_path, channel_username, caption=""):
+    await client.start()
+    msg = await client.send_file(channel_username, file_path, caption=caption)
+    return msg.id  
+
 # ---------- Utilities ----------
 def safe_filename(name: str, max_len=120) -> str:
     if not name:
@@ -60,19 +74,29 @@ def safe_filename(name: str, max_len=120) -> str:
         name = name[:max_len]
     return name
 
-def upload_to_cloud(file_path, title):
+@bot.message_handler(content_types=['document', 'video', 'audio', 'photo'])
+def handle_media(message: types.Message):
     try:
-        client = storage.Client()
-        bucket = client.bucket(GCS_BUCKET_NAME)
-        blob_name = f"files/{safe_filename(title)}_{int(os.path.getmtime(file_path))}{os.path.splitext(file_path)[1]}"
-        blob = bucket.blob(blob_name)
-        blob.upload_from_filename(file_path)
-        # generate signed URL (valid 2 hours)
-        url = blob.generate_signed_url(expiration=7200)
-        return url
+        # user ne bot ko bheja hua message channel me forward karo
+        bot.forward_message(chat_id=CHANNEL, from_chat_id=message.chat.id, message_id=message.message_id)
+        bot.reply_to(message, "✅ File channel mein forward kar di gayi.")
     except Exception as e:
-        print("Cloud upload error:", e)
-        return None
+        # agar forward fail ho to fallback
+        bot.reply_to(message, f"⚠️ Forward failed: {e}\nTrying upload fallback...")
+        try:
+            # fallback: download then send
+            file_info = bot.get_file(message.document.file_id) if message.content_type == 'document' else bot.get_file(message.video.file_id)
+            downloaded = bot.download_file(file_info.file_path)
+            local_path = "/tmp/" + file_info.file_path.split('/')[-1]
+            with open(local_path, 'wb') as f:
+                f.write(downloaded)
+
+            with open(local_path, 'rb') as f:
+                bot.send_document(CHANNEL, f, caption="Uploaded by bot (fallback)")
+            bot.reply_to(message, "✅ Fallback: file channel mein upload kar di.")
+        except Exception as e2:
+            bot.reply_to(message, f"❌ Both forward & upload failed: {e2}")
+
 
 # ---------- /start and /upgrade ----------
 @bot.message_handler(commands=["start"])
@@ -207,15 +231,10 @@ def process_audio(chat_id, fmt):
             file_path = ydl.prepare_filename(info)
 
         size_mb = os.path.getsize(file_path)/(1024*1024)
-        if size_mb < 50:
+        if size_mb <= 50:
             with open(file_path, "rb") as f:
                 bot.send_audio(chat_id, f, caption=f"🎵 {title}")
-        else:
-            cloud = upload_to_cloud(file_path, title)
-            if cloud:
-                bot.send_message(chat_id, f"⚠️ Audio too big ({int(size_mb)}MB). Cloud link:\n{cloud}")
-            else:
-                bot.send_message(chat_id, "🚨 Cloud upload failed.")
+            
     except Exception as e:
         print("process_audio error:", e)
         bot.send_message(chat_id, f"❌ Audio failed: {e}")
@@ -348,30 +367,32 @@ def process_video(chat_id, fmt, trim_times):
     title = ud["title"]
     temp_dir = tempfile.mkdtemp()
     try:
-        outtmpl = os.path.join(temp_dir,f"{title}.%(ext)s")
+        outtmpl = os.path.join(temp_dir, f"{title}.%(ext)s")
         ydl_opts = {
-    "format": fmt["format_id"],
-    "outtmpl": outtmpl,
-    "merge_output_format": "mp4",
-    "quiet": True,
-    "noplaylist": True,
-    "socket_timeout": 1200,   # increase to 10 min
-    "ratelimit": 10_000_000, # 2 MB/s max
-    "noprogress": True
-}
+            "format": fmt["format_id"],
+            "outtmpl": outtmpl,
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "noplaylist": True,
+            "retries": 10,
+            "fragment_retries": 10,
+            "socket_timeout": 0,  # infinite
+            "ratelimit": 10_000_000,
+            "noprogress": True
+        }
 
         last_update = 0
         def phook(d):
             nonlocal last_update
-            if d.get("status")=="downloading":
+            if d.get("status") == "downloading":
                 if time.time() - last_update > 4:
                     total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                    downloaded = d.get("downloaded_bytes",0)
+                    downloaded = d.get("downloaded_bytes", 0)
                     if total:
-                        pct = int(downloaded*100/total)
+                        pct = int(downloaded * 100 / total)
                         bot.send_message(chat_id, f"⬇️ Downloading... {pct}%")
                     last_update = time.time()
-            elif d.get("status")=="finished":
+            elif d.get("status") == "finished":
                 bot.send_message(chat_id, "✅ Download finished. Processing...")
 
         ydl_opts["progress_hooks"] = [phook]
@@ -381,13 +402,12 @@ def process_video(chat_id, fmt, trim_times):
 
         final_path = file_path
         if trim_times:
-              start, end = trim_times
-              trimmed = os.path.join(temp_dir, f"trimmed_{title}.mp4")
-              trim_video_ffmpeg(file_path, trimmed, start, end)
-              final_path = trimmed
+            start, end = trim_times
+            trimmed = os.path.join(temp_dir, f"trimmed_{title}.mp4")
+            trim_video_ffmpeg(file_path, trimmed, start, end)
+            final_path = trimmed
 
-
-        # create thumbnail (safe)
+        # create thumbnail
         try:
             clip_for_thumb = VideoFileClip(final_path)
             duration = clip_for_thumb.duration
@@ -400,22 +420,54 @@ def process_video(chat_id, fmt, trim_times):
         except Exception as e:
             print("Thumb create failed:", e)
             thumb_path = None
+            duration = 0
 
-        size_mb = os.path.getsize(final_path)/(1024*1024)
+        size_mb = os.path.getsize(final_path) / (1024 * 1024)
 
         if size_mb > 50:
+            # 🔹 Large file → Telethon se channel me upload
+            try:
+                import asyncio
+
+                async def telethon_upload():
+                    await client.start()
+                    msg = await client.send_file(
+                        CHANNEL,
+                        final_path,
+                        caption=f"{title}\nDuration: {int(duration)}s"
+                    )
+                    return msg.id
+
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                msg_id = loop.run_until_complete(telethon_upload())
+
+                bot.send_message(
+                    chat_id,
+                    f"✅ Video uploaded to channel.\n👉 Check: https://t.me/{str(CHANNEL).replace('-100','')}/{msg_id}"
+                )
+            except Exception as e:
+                bot.send_message(chat_id, f"❌ Telethon upload failed: {e}")
+
+        else:
+            # 🔹 Small file → Bot API se direct user ko bhejo
             with open(final_path, "rb") as vf:
                 if thumb_path:
                     with open(thumb_path, "rb") as th:
-                        bot.send_video(chat_id, vf, caption=f"{title}\nDuration: {int(duration)}s", thumb=th, supports_streaming=True)
+                        bot.send_video(
+                            chat_id,
+                            vf,
+                            caption=f"{title}\nDuration: {int(duration)}s",
+                            thumb=th,
+                            supports_streaming=True
+                        )
                 else:
-                    bot.send_video(chat_id, vf, caption=f"{title}\nDuration: {int(duration)}s", supports_streaming=True)
-        else:
-            cloud_url = upload_to_cloud(final_path, title)
-            if cloud_url:
-                bot.send_message(chat_id, f"⚠️ File too big ({int(size_mb)}MB). Uploaded to cloud:\n{cloud_url}")
-            else:
-                bot.send_message(chat_id, "🚨 Cloud upload failed.")
+                    bot.send_video(
+                        chat_id,
+                        vf,
+                        caption=f"{title}\nDuration: {int(duration)}s",
+                        supports_streaming=True
+                    )
 
     except Exception as e:
         print("process_video error:", e)
@@ -425,6 +477,15 @@ def process_video(chat_id, fmt, trim_times):
         with user_data_lock:
             user_data.pop(chat_id, None)
 
-# ---------- run ----------
+def safe_send_video(chat_id, file, **kwargs):
+    for i in range(3):  # 3 retries
+        try:
+            return bot.send_video(chat_id, file, **kwargs)
+        except Exception as e:
+            print(f"Upload failed, retry {i+1}: {e}")
+            time.sleep(5)
+    raise
+
+
 print("Bot is running...")
 bot.infinity_polling()
